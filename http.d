@@ -1,7 +1,7 @@
 import std.stdio, std.exception, std.typecons, std.conv, std.c.stdlib,
        core.thread, core.sys.posix.arpa.inet, core.sys.posix.signal,
        core.sys.posix.poll, core.stdc.errno;
-import socket, socketstream, httpparser, eventloop, util;
+import socket, socketstream, httpparser, allocator, eventloop, util;
 public import httpparser: HttpRequest, HttpResponse;
 
 alias void delegate(ref HttpRequest, HttpResponder) HttpRequestHandler;
@@ -15,10 +15,8 @@ static this()
   sigaction(SIGPIPE, &sa, null);
 }
 
-struct HttpServer
-{
-  enum BUFFERSIZE = PAGESIZE;
-  
+struct HttpServer(size_t BUFFERSIZE = PAGESIZE)
+{ 
   this(ushort port)
   {
     create(port);
@@ -67,15 +65,16 @@ struct HttpServer
       debug writeln(newSock.fd, " accept()ed");
       if (_connections < maxConnections)
       {
-        (new Fiber(scopeDelegate(
-        {
-          auto fibSock = newSock; // We move newSock right away, so scopeDelegate is safe
+        (new Fiber(scopeDelegate( // We move newSock right away,
+        {                         // so scopeDelegate is safe
+          auto fibSock = newSock; 
           ++_connections;
           debug writeln("connections = ", _connections);
+          ubyte* buf = cast(ubyte*) _bufAllocator.allocate();
+          scope(exit) _bufAllocator.deallocate(buf);
           try
           {
-            ubyte[BUFFERSIZE] buffer = void;
-            auto ss = SocketStream!(AsyncSocket*)(&fibSock, buffer);
+            auto ss = SocketStream!(AsyncSocket*)(&fibSock, buf[0..BUFFERSIZE]);
             parseHttpRequest(&ss,
               (ref HttpRequest request)
               {
@@ -90,7 +89,7 @@ struct HttpServer
           --_connections;
           fibSock.close();
         }
-        ), BUFFERSIZE + PAGESIZE*3)).call();
+        ), PAGESIZE)).call();
       }
       else
         newSock.close();
@@ -101,6 +100,7 @@ struct HttpServer
   AsyncSocket _socket;
   uint _connections;
   bool _stop;
+  ExactFreeList!(BUFFERSIZE, Mallocator, true) _bufAllocator;
 }
 
 struct HttpResponder
@@ -164,8 +164,6 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
     }
     else
       request(method, uri, headers);
-
-    //debug stderr.writeln("request sent");
     
     getResponse((ref HttpResponse response)
       {
@@ -193,7 +191,10 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
   void close()
   {
     if(_socket.isOpen)
+    {
       _socket.close();
+      _bufAllocator.deallocate(_buf);
+    }
   }
   
   private:  
@@ -207,7 +208,8 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
     if (!_socket.isOpen)
     {
       createAndConnect();
-      _ss = SocketStreamType(&_socket, _buffer);
+      _buf = cast(ubyte*) _bufAllocator.allocate();
+      _ss = SocketStreamType(&_socket, _buf[0..BUFFERSIZE]);
     }
     else
     {
@@ -251,7 +253,8 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
   SocketT _socket;
   alias SocketStream!(SocketT*) SocketStreamType;
   SocketStreamType _ss;
-  ubyte[BUFFERSIZE] _buffer;
+  static ExactFreeList!(BUFFERSIZE, Mallocator, true) _bufAllocator;
+  ubyte* _buf;
 }
 
 private mixin template HttpSender()

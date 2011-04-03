@@ -1,1 +1,1 @@
-dmd -debug example.d http.d socket.d socketstream.d httpparser.d eventloop.d event.d bufferedstream.d syscall.d util.d epoll.d
+dmd -debug example.d http.d socket.d socketstream.d httpparser.d eventloop.d event.d bufferedstream.d syscall.d allocator.d util.d epoll.d
