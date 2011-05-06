@@ -170,11 +170,11 @@ final class EventLoop
   
   Notification!() onNextIteration;
 
-  private:
+private:
   enum MAX_EVENTS = 10;
   int _fd = -1;
   EventInfo[] _eventInfo;
-  alias BinaryHeap!(Timeout*[], q{a.time > b.time}) TimeoutQueue;
+  alias BinaryHeap!(Timeout*[], "a.time > b.time") TimeoutQueue;
   TimeoutQueue _timeoutQueue;
   bool _running;
   bool _timeoutInsertMayReplace;

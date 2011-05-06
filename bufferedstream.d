@@ -3,7 +3,7 @@ import std.exception;
 void popAndNotEmpty(BufStream)(BufStream stream)
 {
     stream.popFront();
-    enforce(!stream.empty, "stream ended");
+    enforce(!stream.empty, "stream ended unexpectedly");
 }
 
 void ensureLength(BufStream)(BufStream stream, size_t n)
@@ -18,7 +18,7 @@ void ensureLength(BufStream)(BufStream stream, size_t n)
     }
 
     size_t toRead = n - stream.front.length;
-    enforce(stream.appendToFront(toRead) >= toRead, "stream ended");
+    enforce(stream.appendToFront(toRead) >= toRead, "stream ended unexpectedly");
   }
 }
 

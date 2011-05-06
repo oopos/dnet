@@ -1,12 +1,11 @@
 import std.stdio, std.exception, std.typecons, std.conv, std.c.stdlib,
-       core.thread, core.sys.posix.arpa.inet, core.sys.posix.signal,
+       std.array, core.thread, core.sys.posix.arpa.inet, core.sys.posix.signal,
        core.sys.posix.poll, core.stdc.errno;
 import socket, socketstream, httpparser, allocator, eventloop, util;
-public import httpparser: HttpRequest, HttpResponse;
+public import httpparser: HttpRequest, HttpResponse, ContentReader;
 
-alias void delegate(ref HttpRequest, HttpResponder) HttpRequestHandler;
-// Scope correct?
 enum PAGESIZE = 4096;
+enum BUFFERSIZE = PAGESIZE;
 
 static this()
 {
@@ -15,8 +14,31 @@ static this()
   sigaction(SIGPIPE, &sa, null);
 }
 
-struct HttpServer(size_t BUFFERSIZE = PAGESIZE)
+struct HttpServer
 { 
+  struct Conversation
+  {
+    HttpPeer!AsyncSocket _peer;
+    alias _peer this;
+
+    @disable this(this) {assert(0);};
+
+    private this(AsyncSocket socket)
+    {
+      _peer._socket = socket;
+    }
+
+    void respond(ushort status, string[string] headers)
+    {
+      _peer.sendMessage("HTTP/1.1 "~statusStrings[status], headers);
+    }
+  }
+
+  alias void delegate(HttpRequest, ref Conversation) RequestHandler;
+  // Scope correct?
+
+  @disable this(this) {assert(0);};
+
   this(ushort port)
   {
     create(port);
@@ -54,7 +76,7 @@ struct HttpServer(size_t BUFFERSIZE = PAGESIZE)
 
   @property uint connections() {return _connections;}
   uint maxConnections = uint.max;
-  HttpRequestHandler onRequest;
+  RequestHandler onRequest;
   
   private:
   void accept()
@@ -67,26 +89,55 @@ struct HttpServer(size_t BUFFERSIZE = PAGESIZE)
       {
         (new Fiber(scopeDelegate( // We move newSock right away,
         {                         // so scopeDelegate is safe
-          auto fibSock = newSock; 
+          auto fibSock = newSock;
           ++_connections;
-          debug writeln("connections = ", _connections);
+          debug writeln("connections: ", _connections);
           ubyte* buf = cast(ubyte*) _bufAllocator.allocate();
-          scope(exit) _bufAllocator.deallocate(buf);
+
           try
           {
-            auto ss = SocketStream!(AsyncSocket*)(&fibSock, buf[0..BUFFERSIZE]);
-            parseHttpRequest(&ss,
-              (ref HttpRequest request)
+            alias SocketStream!AsyncSocket Stream;
+            auto stream = Stream(fibSock, buf[0..BUFFERSIZE]);
+            auto conversation = Conversation(fibSock);
+            foreach (ref request; HttpRequestParser!(Stream*)(&stream))
+            {
+              while (!conversation.receivedContent.empty)
+                conversation.receivedContent.popFront(); // purge unread content
+      
+              string* transferEncoding, contentLengthStr;
+              if (transferEncoding = "transfer-encoding" in request.headers,
+                transferEncoding && simpleToLower(*transferEncoding) == "chunked")
               {
-                onRequest(request, HttpResponder(&fibSock));
-              });
+                conversation.receivedContent = ContentReader!(Stream*)(&stream);
+              }
+              else if (contentLengthStr = "content-length" in request.headers,
+                contentLengthStr)
+              {
+                ulong contentLength;
+                try
+                  contentLength = to!ulong(*contentLengthStr);
+                catch(ConvException)
+                  throw new HttpParserException("invalid Content-Length");
+                
+                conversation.receivedContent =
+                  ContentReader!(Stream*)(&stream, contentLength);
+              }
+              else // Neither chunked nor content-length
+              {
+                conversation.receivedContent =
+                  ContentReader!(Stream*)(&stream, 0);
+              }
+              onRequest(request, conversation);
+            }
           }
           catch (Exception e) 
           {
             writeln("Error in fd ", fibSock.fd, ": ", e.msg);
           }
+
+          _bufAllocator.deallocate(buf);
+          --_connections;         
           debug writeln(fibSock.fd, " close()d");
-          --_connections;
           fibSock.close();
         }
         ), PAGESIZE)).call();
@@ -103,32 +154,15 @@ struct HttpServer(size_t BUFFERSIZE = PAGESIZE)
   ExactFreeList!(BUFFERSIZE, Mallocator, true) _bufAllocator;
 }
 
-struct HttpResponder
-{
-  mixin HttpSender;
-  AsyncSocket* socket;
-  alias socket _socket;
-  HttpRequest request;
-  HttpContentEvent onContent;
-  
-  /*this(AsyncSocket* socket, HttpRequest request)
-  {
-    this.socket = socket;
-    this.request = request;
-  }*/
-  
-  void respond(uint status, string[string] headers)
-  {
-    sendHeader("HTTP/1.1 " ~ statusStrings[status], headers);
-  }
-}
-
-alias BasicHttpClient!Socket HttpClient;
+alias BasicHttpClient!SyncSocket HttpClient;
 alias BasicHttpClient!AsyncSocket HttpClientAsync;
 
-struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
+struct BasicHttpClient(Socket, size_t BUFFERSIZE = PAGESIZE)
 {
-  mixin HttpSender;
+  HttpPeer!Socket _peer;
+  alias _peer this;
+
+  @disable this(this) {assert(0);};
 
   this(uint ip, ushort port)
   {
@@ -136,8 +170,17 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
   }
 
   ~this()
+  {writeln("httpclient dtor");
+    if (_peer._socket.isOpen)
+      close();
+  }
+
+  void close()
   {
-    close();
+    assert(_peer._socket.isOpen);
+    _bufAllocator.deallocate(_buf);
+    _buf = null;
+    _peer._socket.close();
   }
 
   void setAddress(uint ip, ushort port)
@@ -148,53 +191,40 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
   void request(string method, string uri, string[string] headers)
   {
     ensureConnection();
-    sendHeader(method~' '~uri~" HTTP/1.1\r\n", headers);
-  }
-
-  auto autoRequest(string method, string uri, string[string] headers,
-    string content = null, size_t maxResponseContentLength = 200*1024)
-  {
-    HttpResponse savedResponse;
-    string savedContent;
-    if (content.length)
-    {
-      headers["content-length"] = to!string(content.length);
-      request(method, uri, headers);
-      sendContent(content);
-    }
-    else
-      request(method, uri, headers);
-    
-    getResponse((ref HttpResponse response)
-      {
-        savedResponse = response;
-        response.onContent =
-          (const(char)[] chunk)
-          {
-            if (savedContent.length + chunk.length > maxResponseContentLength)
-            {
-              response.onContent = null; // Stop appending chunks
-              return;
-            }
-            savedContent ~= chunk; 
-          };
-      });
-    return Tuple!(HttpResponse, "response", string, "content")
-      (savedResponse, savedContent);
+    writeln("ensure ", _peer._socket.fd);
+    _peer.sendMessage(method~' '~uri~" HTTP/1.1\r\n", headers);
   }
   
-  void getResponse(scope HttpResponseHandler onResponse)
+  HttpResponse getResponse()
   {
-    parseHttpResponse(&_ss, onResponse);
-  }
+    while (!_peer.receivedContent.empty) // purge unread content
+      _peer.receivedContent.popFront();
 
-  void close()
-  {
-    if(_socket.isOpen)
+    HttpResponse response = parseHttpResponse(&_stream);
+
+    string* transferEncoding, contentLengthStr;
+    if (transferEncoding = "transfer-encoding" in response.headers,
+        transferEncoding && simpleToLower(*transferEncoding) == "chunked")
     {
-      _socket.close();
-      _bufAllocator.deallocate(_buf);
+      _peer.receivedContent = ContentReader!(Stream*)(&_stream);
     }
+    else if (contentLengthStr = "content-length" in response.headers,
+      contentLengthStr)
+    {
+      ulong contentLength;
+      try
+        contentLength = to!ulong(*contentLengthStr);
+      catch(ConvException)
+        throw new HttpParserException("invalid Content-Length");
+      
+      _peer.receivedContent = ContentReader!(Stream*)(&_stream, contentLength);
+    }
+    else // Neither chunked nor content-length
+    {
+      assert(0, "not implemented");
+    }
+
+    return response;
   }
   
   private:  
@@ -205,72 +235,62 @@ struct BasicHttpClient(SocketT, size_t BUFFERSIZE = PAGESIZE)
     auto pfd = pollfd(_socket.fd, cast(short) 0xffff); // all events
     syscallEnforce(poll(&pfd, 1, 0), "poll");*/
     
-    if (!_socket.isOpen)
+    if (!_peer._socket.isOpen)
     {
-      createAndConnect();
+      _peer._socket.create(AF_INET, SOCK_STREAM, 0);
+      scope(failure) _peer._socket.close();
+      _peer._socket.connect(_sin);
       _buf = cast(ubyte*) _bufAllocator.allocate();
-      _ss = SocketStreamType(&_socket, _buf[0..BUFFERSIZE]);
+      _stream = Stream(_peer._socket, _buf[0..BUFFERSIZE]); // What happens to this when empty?
+      return;
     }
-    else
+
+    version(linux) enum MSG_DONTWAIT = 0x40;
+    
+    ubyte buf;
+    recvAgain:
+    auto ret = recv(_peer._socket.fd, &buf, 1, MSG_DONTWAIT);
+    if (ret == -1)
     {
-      version(linux)
-        enum MSG_DONTWAIT = 0x40;
-      
-      ubyte buf;
-      recvAgain:
-      auto ret = recv(_socket.fd, &buf, 1, MSG_DONTWAIT);
-      if (ret == -1)
-      {
-        if (errno == EAGAIN)
-          return;
-        if (errno == EINTR)
-          goto recvAgain;
-        throw new ErrnoException("recv", __FILE__, __LINE__);
-      }
-
-      if (ret == 0)
-      {
-        debug writeln("Disconnected. Reconnecting.");
-        _socket.close();
-        createAndConnect();
-      }
-      else if (ret == 1)
-      {
-        _socket.close();
-        throw new Exception("HttpClient: Unexpected data from server");
-      }
+      if (errno == EAGAIN)
+        return;
+      if (errno == EINTR)
+        goto recvAgain;
+      throw new ErrnoException("recv", __FILE__, __LINE__);
     }
-  }
 
-  void createAndConnect()
-  {
-    _socket.create(AF_INET, SOCK_STREAM, 0);
-    scope(failure) _socket.close();
-    _socket.connect(_sin);
+    if (ret == 0)
+    {
+      debug writeln("Disconnected. Reconnecting.");
+      scope(failure)
+      {
+        _bufAllocator.deallocate(_buf);
+        _buf = null;
+      }
+      _peer._socket.close();
+      _peer._socket.create(AF_INET, SOCK_STREAM, 0);   
+      scope(failure) _peer._socket.close();
+      _peer._socket.connect(_sin);
+      _stream = Stream(_peer._socket, _buf[0..BUFFERSIZE]); // What happens to this when empty?
+    }
+    else if (ret == 1)
+    {
+      scope(exit) close();
+      throw new Exception("HttpClient: Unexpected data from server");
+    }
   }
   
+  alias SocketStream!Socket Stream;
   sockaddr_in _sin;
-  SocketT _socket;
-  alias SocketStream!(SocketT*) SocketStreamType;
-  SocketStreamType _ss;
+  Stream _stream;
   static ExactFreeList!(BUFFERSIZE, Mallocator, true) _bufAllocator;
   ubyte* _buf;
 }
 
-private mixin template HttpSender()
+private struct HttpPeer(Socket)
 {
-  void sendHeader(string firstline, string[string] headers)
-  {
-    string headersStr;
-    foreach (field, value; headers)
-      headersStr ~= field~": "~value~"\r\n";
-    headersStr ~= "\r\n";
-    
-    if ("content-length" in headers)
-      sendCorked(firstline, headersStr);
-    else
-      send(firstline, headersStr);
-  }
+  alias SocketStream!Socket Stream;
+  ContentReader!(Stream*) receivedContent;
   
   void sendContent(in char[] chunk)
   {
@@ -296,6 +316,22 @@ private mixin template HttpSender()
     send(trailersStr);
   }
   
+private:
+  Socket _socket;
+
+  void sendMessage(string firstline, string[string] headers)
+  {
+    string headersStr;
+    foreach (field, value; headers)
+      headersStr ~= field~": "~value~"\r\n";
+    headersStr ~= "\r\n";
+    
+    if ("content-length" in headers)
+      sendCorked(firstline, headersStr);
+    else
+      send(firstline, headersStr);
+  }
+
   void send(in char[][] chunks...)
   {
     _socket.sendAll(0, cast(const ubyte[][]) chunks);
@@ -307,15 +343,31 @@ private mixin template HttpSender()
   }
 }
 
-string[uint] statusStrings;
+string joinContent(Stream)
+  (ref ContentReader!Stream content, size_t maxLength = 256*1024)
+{
+  Appender!string a;
+  for(; !content.empty; content.popFront())
+  {
+    content.Chunk* chunk = &content.front();
+    ulong newLength = a.capacity + chunk.totalLength;
+    enforce(newLength <= maxLength, "max content length exceeded");
+    a.reserve(cast(size_t) newLength);
+    for (; !chunk.empty; chunk.popFront())
+      a.put(chunk.front);
+  }
+  return a.data;
+}
+
+string[ushort] statusStrings;
 
 static this()
 {
-  statusStrings = // This list is taken from node.js
+  statusStrings =
     [
       100: "100 Continue\r\n",
       101: "101 Switching Protocols\r\n",
-      102: "102 Processing\r\n",                 // RFC 2518, obsoleted by RFC 4918
+      102: "102 Processing\r\n",              // RFC 2518, obsoleted by RFC 4918
       200: "200 OK\r\n",
       201: "201 Created\r\n",
       202: "202 Accepted\r\n",
@@ -349,7 +401,6 @@ static this()
       415: "415 Unsupported Media Type\r\n",
       416: "416 Requested Range Not Satisfiable\r\n",
       417: "417 Expectation Failed\r\n",
-      418: "418 I'm a teapot\r\n",               // RFC 2324
       422: "422 Unprocessable Entity\r\n",       // RFC 4918
       423: "423 Locked\r\n",                     // RFC 4918
       424: "424 Failed Dependency\r\n",          // RFC 4918

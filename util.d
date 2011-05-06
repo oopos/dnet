@@ -25,3 +25,8 @@ unittest
   assert(hex!ubyte(3) == "3");
   assert(hex(0x11223344AABBCCDD) == "11223344AABBCCDD");
 }
+
+template methodAddress(string method)
+{
+  enum methodAddress = &mixin(method);
+}

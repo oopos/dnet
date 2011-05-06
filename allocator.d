@@ -73,7 +73,7 @@ struct ExactFreeList(size_t S, B, bool fixedSize = false)
   B b;
   alias b this;
 
-  private:
+private:
   struct List { List* next; }
   List* list;
 }

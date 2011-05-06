@@ -16,14 +16,14 @@
    Software Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA
    02111-1307 USA.  */
 
-
+import std.conv;
 import core.sys.posix.signal : sigset_t;
 
 /* Flags to be passed to epoll_create2.  */
 enum
 {
-  EPOLL_CLOEXEC = 02000000,
-  EPOLL_NONBLOCK = 04000
+  EPOLL_CLOEXEC = octal!2000000,
+  EPOLL_NONBLOCK = octal!4000
 }
 
 

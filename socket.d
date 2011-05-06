@@ -18,7 +18,7 @@ template isSocketAddress(T)
                       || is(T == sockaddr);
 }
 
-struct Socket
+struct SyncSocket
 {
   mixin SocketCommon;
   
@@ -60,12 +60,12 @@ struct Socket
       "recv");
   }
   
-  Socket accept()
+  SyncSocket accept()
   {
     int fd = interruptibleSyscall(
       .accept(_fd, null, null),
       "accept");
-    Socket newSocket;
+    SyncSocket newSocket;
     newSocket._fd = fd;
     return newSocket;
   }
@@ -108,7 +108,7 @@ struct AsyncSocket
   
   size_t send(in ubyte[] data, int flags = 0)
   {
-   return noblockSyscall(
+    return noblockSyscall(
       .send(_fd, data.ptr, data.length, flags),
       EventLoop.OUT,
       "send");
@@ -165,7 +165,7 @@ struct AsyncSocket
     }
   }
   
-  private:
+private:
   void yield(int events)
   {
     auto thisFiber = Fiber.getThis();
@@ -262,7 +262,7 @@ private mixin template SocketCommon()
   int fd() @property {return _fd;}
   bool isOpen() @property {return _fd != -1;}
   
-  private:
+private:
   int _fd = -1;
 }
 

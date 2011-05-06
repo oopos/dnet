@@ -7,6 +7,8 @@ struct SocketStream(SocketT)
   SocketT socket;
   ubyte[] buf;
 
+  @disable this(this) {assert(0);};
+
   @property
   {
     ubyte[] front()
