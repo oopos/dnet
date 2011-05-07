@@ -86,7 +86,7 @@ HttpResponse parseHttpResponse(Stream)(Stream stream)
       break;
     }
   }
-  
+
   response.headers = parseHeaders(stream);
   return response;
 }
@@ -313,10 +313,19 @@ struct ContentReader(Stream)
     {
       _stream = stream;
       _totalLength = _remaining = length;
+      _empty = false;
+    }
+
+    this(Stream stream, const char[] packet)
+    {
+      _stream = stream;
+      _packet = packet;
+      _totalLength = _remaining = packet.length;
+      _empty = false;
     }
 
     @property ulong totalLength() {return _totalLength;}
-    @property bool empty() { return _empty; }
+    @property bool empty() {return _empty;}
 
     @property const(char)[] front()
     {
@@ -327,6 +336,9 @@ struct ContentReader(Stream)
     void popFront()
     {
       assert(!empty);
+
+      _stream.shiftFront(_packet.length);
+      _remaining -= _packet.length;
       if (!_remaining)
       {
         _empty = true;
@@ -336,15 +348,14 @@ struct ContentReader(Stream)
         popAndNotEmpty(_stream);
       size_t toRead = min(_stream.front.length, _remaining);
       _packet = cast(char[]) _stream.front[0..toRead];
-      _remaining -= toRead;
-      _stream.shiftFront(toRead);
     }
+
   private:
-    char[] _packet;
+    const(char)[] _packet;
     ulong _totalLength;
     ulong _remaining;
     Stream _stream;
-    bool _empty;
+    bool _empty = true;
   }
 
   private Chunk _chunk;
@@ -354,13 +365,24 @@ struct ContentReader(Stream)
   this(Stream stream)
   {
     _stream = stream;
-    _singleChunk = false;
   }
-  
-  this(Stream stream, ulong contentLength)
+
+  void setContentLength(ulong length)
   {
-    _stream = stream;
-    _chunk = Chunk(stream, contentLength);
+    _chunk = Chunk(_stream, length);
+    _empty = false;
+  }
+
+  void setChunked()
+  {
+    _popFrontImpl = &popFront_chunked;
+    _empty = false;
+  }
+
+  void setReadUntilTerminated()
+  {
+    _popFrontImpl = &popFront_untilTerminated;
+    _empty = false;
   }
 
   @property bool empty() {return _empty;}
@@ -374,55 +396,85 @@ struct ContentReader(Stream)
   void popFront()
   {
     assert(!empty);
+    _popFrontImpl(this);
+  }
 
-    while (!_chunk.empty) _chunk.popFront();
-    if (_singleChunk)
+  static void popFront_knownContentLength(ref typeof(this) self)
+  {
+    with (self)
     {
+      // Present a single chunk
+      while (!_chunk.empty) _chunk.popFront();
       _empty = true;
-      return;
     }
+  }
 
-    if (_firstChunk)
-      _firstChunk = false;
-    else
-      shiftStream(_stream, "\r\n".length);
-
-    byte h = unhex[frontThenShift(_stream)];
-    _enforce(h != -1, "the chunk didn't start with a length");
-    ulong chunkSize = h;
-    for (size_t i; ; ++i)
+  static void popFront_untilTerminated(ref typeof(this) self)
+  {
+    with (self)
     {
-      if (i == _stream.front.length)
+      if (!_chunk.empty || !_stream.front.length)
       {
-        popAndNotEmpty(_stream);
-        i = 0;
+        _stream.popFront();
+        if (_stream.empty)
+        {
+          _empty = true;
+          return;
+        }
       }
-      h = unhex[_stream.front[i]];
-      if (h == -1)
-      {
-        _stream.shiftFront(i + 1);
-        break;
-      }
-      chunkSize *= 16;
-      chunkSize += h;
+      _chunk = Chunk(_stream, cast(char[]) _stream.front);
     }
-    
-    // Ignore chunk parameters
-    while (frontThenShift(_stream) != '\n') {}
+  }
 
-    if (chunkSize == 0)
+  static void popFront_chunked(ref typeof(this) self)
+  {
+    with (self)
     {
-      trailingHeaders = parseHeaders(_stream);
-      _empty = true;
-      return;
+      while (!_chunk.empty) _chunk.popFront();
+
+      if (_firstChunk)
+        _firstChunk = false;
+      else
+        shiftStream(_stream, "\r\n".length);
+
+      byte h = unhex[frontThenShift(_stream)];
+      _enforce(h != -1, "the chunk didn't start with a length");
+      ulong chunkSize = h;
+      for (size_t i; ; ++i)
+      {
+        if (i == _stream.front.length)
+        {
+          popAndNotEmpty(_stream);
+          i = 0;
+        }
+        h = unhex[_stream.front[i]];
+        if (h == -1)
+        {
+          _stream.shiftFront(i + 1);
+          break;
+        }
+        chunkSize *= 16;
+        chunkSize += h;
+      }
+      
+      // Ignore chunk parameters
+      while (frontThenShift(_stream) != '\n') {}
+
+      if (chunkSize == 0)
+      {
+        trailingHeaders = parseHeaders(_stream);
+        _empty = true;
+        return;
+      }
+
+      _chunk = Chunk(_stream, chunkSize);
     }
-    _chunk = Chunk(_stream, chunkSize);
   }
 
   Stream _stream;
-  bool _singleChunk = true;
+  auto _popFrontImpl = &popFront_knownContentLength;
   bool _firstChunk = true;
-  bool _empty;
+  bool _empty = true;
 }
 
 private immutable byte[256] unhex =

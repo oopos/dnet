@@ -5,23 +5,23 @@ import http, eventloop, util;
 void main()
 {
   auto server = HttpServer(8080);
-  auto couchDb = HttpClient(0x7f000001, 5984);
   server.maxConnections = 500;
   server.onRequest = scopeDelegate(
     (HttpRequest request, ref HttpServer.Conversation conversation)
     {
       if (request.uri != "/")
       {
-        conversation.respond(404, ["Content-Length": "0"]);
+        conversation.stockResponse(Status.NotFound);
         return;
       }
 
+      auto couchDb = HttpClientAsync(0x7f000001, 8081/*5984*/);
       couchDb.request(
         "GET",
         "/example/_design/mydesign/_view/myview",
         ["Host": "localhost"]);
        HttpResponse couchResponse = couchDb.getResponse();
-       enforce(couchResponse.status == 200);
+       enforce(couchResponse.status == Status.OK);
 
        string content = text(
 "<!doctype html>
@@ -73,12 +73,27 @@ void main()
   </body>
 </html>
 `);
-      conversation.respond(200,
+      conversation.respond(Status.OK,
         ["Content-Type": "text/html; charset=utf-8",
          "Transfer-Encoding": "chunked"]); // Chunked for kicks
       conversation.sendChunk(content);
       conversation.endChunked();
     });
     server.start();
+
+
+
+  auto server2 = HttpServer(8081);
+  server2.maxConnections = 501;
+  server2.onRequest = scopeDelegate(
+    (HttpRequest request, ref HttpServer.Conversation conversation)
+    {
+      conversation.respond(Status.OK, null);
+      conversation.sendContent("hei!");
+    });
+    server2.start();
+
+
+
     eventLoop.run();
 }

@@ -32,6 +32,16 @@ struct HttpServer
     {
       _peer.sendMessage("HTTP/1.1 "~statusStrings[status], headers);
     }
+
+    void stockResponse(ushort status)
+    {
+      string message = statusStrings[status][0..$-2]; // strip away \r\n
+      string html =
+        "<!DOCTYPE html><html><head><title>"~message~"</title></head>"~
+        `<body style="text-align:center"><h1>`~message~"</h1></body></html>";
+      respond(status, ["Content-Length": to!string(html.length)]);
+      _peer.sendContent(html);
+    }
   }
 
   alias void delegate(HttpRequest, ref Conversation) RequestHandler;
@@ -103,31 +113,32 @@ struct HttpServer
             {
               while (!conversation.receivedContent.empty)
                 conversation.receivedContent.popFront(); // purge unread content
+              conversation.receivedContent = ContentReader!(Stream*)(&stream);
       
               string* transferEncoding, contentLengthStr;
               if (transferEncoding = "transfer-encoding" in request.headers,
-                transferEncoding && simpleToLower(*transferEncoding) == "chunked")
+                transferEncoding && simpleToLower(*transferEncoding) != "identity")
               {
-                conversation.receivedContent = ContentReader!(Stream*)(&stream);
+                conversation.receivedContent.setChunked();
               }
               else if (contentLengthStr = "content-length" in request.headers,
                 contentLengthStr)
               {
-                ulong contentLength;
+                ulong length;
                 try
-                  contentLength = to!ulong(*contentLengthStr);
+                  length = to!ulong(*contentLengthStr);
                 catch(ConvException)
                   throw new HttpParserException("invalid Content-Length");
                 
-                conversation.receivedContent =
-                  ContentReader!(Stream*)(&stream, contentLength);
+                conversation.receivedContent.setContentLength(length);
               }
-              else // Neither chunked nor content-length
+
+              try onRequest(request, conversation);
+              catch (Exception e)
               {
-                conversation.receivedContent =
-                  ContentReader!(Stream*)(&stream, 0);
+                writeln("500: ", e);
+                conversation.stockResponse(Status.InternalServerError);
               }
-              onRequest(request, conversation);
             }
           }
           catch (Exception e) 
@@ -170,7 +181,7 @@ struct BasicHttpClient(Socket, size_t BUFFERSIZE = PAGESIZE)
   }
 
   ~this()
-  {writeln("httpclient dtor");
+  {
     if (_peer._socket.isOpen)
       close();
   }
@@ -191,37 +202,51 @@ struct BasicHttpClient(Socket, size_t BUFFERSIZE = PAGESIZE)
   void request(string method, string uri, string[string] headers)
   {
     ensureConnection();
-    writeln("ensure ", _peer._socket.fd);
     _peer.sendMessage(method~' '~uri~" HTTP/1.1\r\n", headers);
+    if (method == "HEAD")
+      _expectingHEADResponse = true;
   }
   
   HttpResponse getResponse()
   {
     while (!_peer.receivedContent.empty) // purge unread content
       _peer.receivedContent.popFront();
+    _peer.receivedContent = ContentReader!(Stream*)(&_stream);
 
     HttpResponse response = parseHttpResponse(&_stream);
-
     string* transferEncoding, contentLengthStr;
-    if (transferEncoding = "transfer-encoding" in response.headers,
-        transferEncoding && simpleToLower(*transferEncoding) == "chunked")
+
+    if (_expectingHEADResponse)
     {
-      _peer.receivedContent = ContentReader!(Stream*)(&_stream);
+      // No content even if headers indicate otherwise
+      _expectingHEADResponse = false;
+    }
+    else if (response.status < 200 || // 1xx, informational
+             response.status == Status.NoContent ||
+             response.status == Status.NotModified)
+    {
+      // No content even if headers indicate otherwise
+    }
+    else if (transferEncoding = "transfer-encoding" in response.headers,
+             transferEncoding && simpleToLower(*transferEncoding) != "identity")
+    {
+      // Chunked encoding
+      _peer.receivedContent.setChunked();
     }
     else if (contentLengthStr = "content-length" in response.headers,
-      contentLengthStr)
+             contentLengthStr)
     {
-      ulong contentLength;
-      try
-        contentLength = to!ulong(*contentLengthStr);
+      // Known content length
+      ulong length;
+      try length = to!ulong(*contentLengthStr);
       catch(ConvException)
         throw new HttpParserException("invalid Content-Length");
-      
-      _peer.receivedContent = ContentReader!(Stream*)(&_stream, contentLength);
+      _peer.receivedContent.setContentLength(length);
     }
-    else // Neither chunked nor content-length
+    else
     {
-      assert(0, "not implemented");
+      // The server will terminate the message body by closing the connection
+      _peer.receivedContent.setReadUntilTerminated();
     }
 
     return response;
@@ -261,7 +286,7 @@ struct BasicHttpClient(Socket, size_t BUFFERSIZE = PAGESIZE)
 
     if (ret == 0)
     {
-      debug writeln("Disconnected. Reconnecting.");
+      debug writeln("Disconnected, reconnecting.");
       scope(failure)
       {
         _bufAllocator.deallocate(_buf);
@@ -285,6 +310,7 @@ struct BasicHttpClient(Socket, size_t BUFFERSIZE = PAGESIZE)
   Stream _stream;
   static ExactFreeList!(BUFFERSIZE, Mallocator, true) _bufAllocator;
   ubyte* _buf;
+  bool _expectingHEADResponse;
 }
 
 private struct HttpPeer(Socket)
@@ -359,6 +385,49 @@ string joinContent(Stream)
   return a.data;
 }
 
+enum Status : ushort {
+  Continue                       = 100,
+  SwitchingProtocols             = 101,
+  OK                             = 200,
+  Created                        = 201,
+  Accepted                       = 202,
+  NonAuthoritativeInformation    = 203,
+  NoContent                      = 204,
+  ResetContent                   = 205,
+  PartialContent                 = 206,
+  MultipleChoices                = 300,
+  MovedPermanently               = 301,
+  MovedTemporarily               = 302,
+  SeeOther                       = 303,
+  NotModified                    = 304,
+  UseProxy                       = 305,
+  TemporaryRedirect              = 307,
+  BadRequest                     = 400,
+  Unauthorized                   = 401,
+  PaymentRequired                = 402,
+  Forbidden                      = 403,
+  NotFound                       = 404,
+  MethodNotAllowed               = 405,
+  NotAcceptable                  = 406,
+  ProxyAuthenticationRequired    = 407,
+  RequestTimeout                 = 408,
+  Conflict                       = 409,
+  Gone                           = 410,
+  LengthRequired                 = 411,
+  PreconditionFailed             = 412,
+  RequestEntityTooLarge          = 413,
+  RequestURITooLarge             = 414,
+  UnsupportedMediaType           = 415,
+  RequestedRangeNotSatisfiable   = 416,
+  ExpectationFailed              = 417,
+  InternalServerError            = 500,
+  NotImplemented                 = 501,
+  BadGateway                     = 502,
+  ServiceUnavailable             = 503,
+  GatewayTimeout                 = 504,
+  HTTPVersionNotSupported        = 505
+}
+
 string[ushort] statusStrings;
 
 static this()
@@ -367,7 +436,6 @@ static this()
     [
       100: "100 Continue\r\n",
       101: "101 Switching Protocols\r\n",
-      102: "102 Processing\r\n",              // RFC 2518, obsoleted by RFC 4918
       200: "200 OK\r\n",
       201: "201 Created\r\n",
       202: "202 Accepted\r\n",
@@ -375,7 +443,6 @@ static this()
       204: "204 No Content\r\n",
       205: "205 Reset Content\r\n",
       206: "206 Partial Content\r\n",
-      207: "207 Multi-Status\r\n",               // RFC 4918
       300: "300 Multiple Choices\r\n",
       301: "301 Moved Permanently\r\n",
       302: "302 Moved Temporarily\r\n",
@@ -401,21 +468,11 @@ static this()
       415: "415 Unsupported Media Type\r\n",
       416: "416 Requested Range Not Satisfiable\r\n",
       417: "417 Expectation Failed\r\n",
-      422: "422 Unprocessable Entity\r\n",       // RFC 4918
-      423: "423 Locked\r\n",                     // RFC 4918
-      424: "424 Failed Dependency\r\n",          // RFC 4918
-      425: "425 Unordered Collection\r\n",       // RFC 4918
-      426: "426 Upgrade Required\r\n",           // RFC 2817
       500: "500 Internal Server Error\r\n",
       501: "501 Not Implemented\r\n",
       502: "502 Bad Gateway\r\n",
       503: "503 Service Unavailable\r\n",
       504: "504 Gateway Time-out\r\n",
-      505: "505 HTTP Version Not Supported\r\n",
-      506: "506 Variant Also Negotiates\r\n",    // RFC 2295
-      507: "507 Insufficient Storage\r\n",       // RFC 4918
-      509: "509 Bandwidth Limit Exceeded\r\n",
-      510: "510 Not Extended\r\n"                // RFC 2774
+      505: "505 HTTP Version Not Supported\r\n"
     ];
 }
-
