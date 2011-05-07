@@ -1,5 +1,6 @@
 import std.stdio, std.exception, std.typecons, std.conv, std.c.stdlib,
-       std.array, core.thread, core.sys.posix.arpa.inet, core.sys.posix.signal,
+       std.array, std.string, std.datetime, 
+       core.thread, core.sys.posix.arpa.inet, core.sys.posix.signal,
        core.sys.posix.poll, core.stdc.errno;
 import socket, socketstream, httpparser, allocator, eventloop, util;
 public import httpparser: HttpRequest, HttpResponse, ContentReader;
@@ -30,6 +31,7 @@ struct HttpServer
 
     void respond(ushort status, string[string] headers)
     {
+      headers["Date"] = currentDateTime();
       _peer.sendMessage("HTTP/1.1 "~statusStrings[status], headers);
     }
 
@@ -383,6 +385,22 @@ string joinContent(Stream)
       a.put(chunk.front);
   }
   return a.data;
+}
+
+string currentDateTime()
+{
+  // RFC 2616 3.3.1
+  static immutable string[] days =
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  static immutable string[] months =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  SysTime now = Clock.currTime;
+  now.timezone = UTC();
+  return format("%s, %02d %s %04d %02d:%02d:%02d GMT",
+                 days[now.dayOfWeek],
+                 now.day, months[now.month], now.year,
+                 now.hour, now.minute, now.second);
 }
 
 enum Status : ushort {

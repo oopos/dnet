@@ -4,6 +4,7 @@ import http, eventloop, util;
 
 void main()
 {
+  auto couchDb = HttpClient(0x7f000001, 5984);
   auto server = HttpServer(8080);
   server.maxConnections = 500;
   server.onRequest = scopeDelegate(
@@ -14,8 +15,6 @@ void main()
         conversation.stockResponse(Status.NotFound);
         return;
       }
-
-      auto couchDb = HttpClientAsync(0x7f000001, 8081/*5984*/);
       couchDb.request(
         "GET",
         "/example/_design/mydesign/_view/myview",
@@ -80,20 +79,6 @@ void main()
       conversation.endChunked();
     });
     server.start();
-
-
-
-  auto server2 = HttpServer(8081);
-  server2.maxConnections = 501;
-  server2.onRequest = scopeDelegate(
-    (HttpRequest request, ref HttpServer.Conversation conversation)
-    {
-      conversation.respond(Status.OK, null);
-      conversation.sendContent("hei!");
-    });
-    server2.start();
-
-
 
     eventLoop.run();
 }
