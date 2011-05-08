@@ -31,7 +31,7 @@ struct HttpServer
 
     void respond(ushort status, string[string] headers)
     {
-      headers["Date"] = currentDateTime();
+      headers["Date"] = formatDateTime(Clock.currTime);
       _peer.sendMessage("HTTP/1.1 "~statusStrings[status], headers);
     }
 
@@ -387,7 +387,7 @@ string joinContent(Stream)
   return a.data;
 }
 
-string currentDateTime()
+/*string formatDateTime(SysTime time)
 {
   // RFC 2616 3.3.1
   static immutable string[] days =
@@ -395,12 +395,62 @@ string currentDateTime()
   static immutable string[] months =
     ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
-  SysTime now = Clock.currTime;
-  now.timezone = UTC();
+  time.timezone = UTC();
   return format("%s, %02d %s %04d %02d:%02d:%02d GMT",
-                 days[now.dayOfWeek],
-                 now.day, months[now.month], now.year,
-                 now.hour, now.minute, now.second);
+                days[time.dayOfWeek],
+                time.day, months[time.month-1], time.year,
+                time.hour, time.minute, time.second);
+}*/
+
+string formatDateTime(SysTime time)
+{
+  // RFC 2616 3.3.1
+  static immutable string[] days =
+    ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+  static immutable string[] months =
+    ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+  time.timezone = UTC();
+
+  auto result = uninitializedArray!char(29);
+  result[0..3] = days[time.dayOfWeek];
+  result[3..5] = ", ";
+  auto day = time.day;
+  result[5] = cast(char)('0' + day / 10);
+  result[6] = cast(char)('0' + day % 10);
+  result[7] = ' ';
+  result[8..11] = months[time.month-1];
+  result[11] = ' ';
+  auto year = time.year;
+  result[15] = cast(char)('0' + year % 10);
+  year /= 10;
+  result[14] = cast(char)('0' + year % 10);
+  year /= 10;
+  result[13] = cast(char)('0' + year % 10);
+  result[12] = cast(char)('0' + year / 10);
+  result[16] = ' ';
+  auto hour = time.hour;
+  result[17] = cast(char)('0' + hour / 10);
+  result[18] = cast(char)('0' + hour % 10);
+  result[19] = ':';
+  auto minute = time.minute;
+  result[20] = cast(char)('0' + minute / 10);
+  result[21] = cast(char)('0' + minute % 10);
+  result[22] = ':';
+  auto second = time.second;
+  result[23] = cast(char)('0' + second / 10);
+  result[24] = cast(char)('0' + second % 10);
+  result[25..29] = " GMT";
+
+  return cast(string) result;
+}
+
+unittest
+{
+  assert(formatDateTime(SysTime(DateTime(1998, 12, 25, 2, 15, 3), UTC()))
+         == "Fri, 25 Dec 1998 02:15:03 GMT");
+  assert(formatDateTime(SysTime(DateTime(2011, 5, 8, 17, 13, 59), UTC()))
+         == "Sun, 08 May 2011 17:13:59 GMT");
 }
 
 enum Status : ushort {

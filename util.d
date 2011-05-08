@@ -1,9 +1,17 @@
 import std.traits: isDelegate, isIntegral;
 import std.string: hexdigits;
+import core.memory;
 
 D scopeDelegate(D)(scope D d) if (isDelegate!D)
 {
   return d;
+}
+
+T[] uninitializedArray(T)(size_t length)
+{
+  T* p = cast(T*) GC.malloc(length * T.sizeof,
+    (typeid(T[]).next.flags & 1) ? 0 : GC.BlkAttr.NO_SCAN);
+  return p[0..length];
 }
 
 string hex(T)(T n) if (isIntegral!T)
@@ -24,9 +32,4 @@ unittest
   assert(hex!ubyte(0xFA) == "FA");
   assert(hex!ubyte(3) == "3");
   assert(hex(0x11223344AABBCCDD) == "11223344AABBCCDD");
-}
-
-template methodAddress(string method)
-{
-  enum methodAddress = &mixin(method);
 }
